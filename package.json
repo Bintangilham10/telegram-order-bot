@@ -1,0 +1,15 @@
+{
+  "name": "belugawbotv1",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @belugaw/admin",
+    "check": "npm run check --workspace @belugaw/server",
+    "test": "npm run test --workspace @belugaw/server"
+  }
+}
