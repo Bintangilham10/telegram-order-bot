@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  belugawbot:
+    build:
+      context: .
+      args:
+        - VITE_API_BASE_URL=${API_BASE_URL}
+    container_name: belugawbot
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - DATA_DIR=/app/data
+      - PORT=3000
