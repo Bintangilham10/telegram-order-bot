@@ -1,30 +1,51 @@
-# Boslay Order Bot — Manual QRIS
+# Ciganstore Order Bot — Wallet + Manual GoPay Top Up
 
-Bot Telegram untuk menjual produk digital melalui chat, dengan panel admin React,
-database SQLite, stok terbatas/unlimited, wallet, tiket dukungan, broadcast, review,
-audit log, dan backup.
+Bot Telegram untuk menjual produk digital menggunakan saldo wallet, dengan panel
+admin React, database SQLite, stok terbatas/unlimited, tiket dukungan, broadcast,
+review, audit log, dan backup.
 
-Pembayaran produk dan top-up wallet menggunakan QRIS merchant statis. Tidak ada
-payment gateway, webhook pembayaran, pembuatan QR dinamis, atau polling provider.
+QR GoPay merchant statis **hanya digunakan untuk mengisi saldo**. Pembelian produk
+tidak menggunakan QR dan selalu dipotong dari wallet. Karena tidak ada payment
+gateway atau webhook pembayaran, setiap bukti top up diverifikasi admin secara
+manual.
 
-## Alur pembayaran
+## Alur penggunaan
 
-1. Pembeli memilih produk dan jumlah.
-2. Server membuat order unik berstatus `pending_payment`.
-3. Bot mengirim detail order, total, instruksi, dan gambar QRIS merchant.
-4. Pembeli menekan **Saya Sudah Bayar**.
-5. Bot meminta foto bukti pembayaran (JPG, PNG, atau WebP; maksimum 2 MB).
-6. Bukti disimpan secara privat dan order menjadi `waiting_confirmation`.
-7. Admin membuka menu **Payments** di panel admin.
-8. Admin menyetujui, menolak, atau meminta bukti ulang.
-9. Persetujuan mengubah status menjadi `delivery_pending`, lalu server mengklaim
-   delivery secara kondisional menjadi `delivering`.
-10. Produk dialokasikan sekali dan dikirim melalui Telegram.
-11. Order baru menjadi `delivered` setelah Telegram menerima pengiriman produk.
-12. Jika Telegram gagal, order kembali ke `delivery_pending`, alokasi dipertahankan,
-    error disimpan, dan admin dapat mencoba pengiriman kembali.
+### Top up wallet
 
-Status order manual:
+1. Pengguna menjalankan `/topup 5000` atau memasukkan nominal Rupiah bulat positif
+   lain sesuai kebutuhan. Nominal minimum saat ini Rp1.
+2. Server membuat order sistem `Wallet Top Up` berstatus `pending_payment`.
+3. Bot mengirim nominal, instruksi, dan QR GoPay merchant statis.
+4. Pengguna menekan **Saya Sudah Bayar**, lalu mengirim foto bukti pembayaran.
+5. File JPG, PNG, atau WebP maksimum 2 MB disimpan secara privat dan top up menjadi
+   `waiting_confirmation`.
+6. Admin membuka **Top Up Reviews**, mencocokkan nominal dengan bukti, kemudian
+   menyetujui, menolak, atau meminta bukti ulang.
+7. Persetujuan menambahkan saldo 1:1 tepat satu kali dan menyelesaikan top up.
+
+Satu pengguna hanya dapat memiliki satu top up aktif. Pengguna harus menyelesaikan,
+membatalkan, atau menunggu permintaan sebelumnya kedaluwarsa sebelum membuat yang
+baru.
+
+### Membeli produk
+
+1. Pengguna memilih produk dan jumlah di bot.
+2. Server memeriksa status akun, ketersediaan stok, dan saldo wallet.
+3. Saldo dipotong dan stok dialokasikan dalam transaksi SQLite yang sama.
+4. Produk dikirim melalui Telegram.
+5. Klik atau callback yang sama tidak memotong saldo dua kali karena setiap checkout
+   memiliki transaction ID unik.
+6. Jika pengiriman Telegram gagal, order masuk `delivery_pending`; admin dapat retry
+   tanpa memotong saldo atau mengalokasikan stok baru.
+
+Top up adalah arus kas masuk ke wallet, bukan penjualan produk. Produk sistem ID `0`
+(`Wallet Top Up`) tidak dihitung sebagai omzet, produk terlaris, atau belanja produk
+pengguna.
+
+## Status order
+
+Status yang digunakan alur top up dan delivery:
 
 - `pending_payment`
 - `waiting_confirmation`
@@ -56,7 +77,10 @@ tidak dimigrasikan secara destruktif.
 │       │   ├── services/payment.js
 │       │   ├── services/telegram.js
 │       │   └── utils/security.js
-│       └── test/manual-payment.test.js
+│       └── test/
+│           ├── manual-payment.test.js
+│           ├── migration.test.js
+│           └── wallet.test.js
 ├── packages/shared/
 ├── Dockerfile
 ├── docker-compose.yml
@@ -65,15 +89,15 @@ tidak dimigrasikan secara destruktif.
 
 ## Persyaratan
 
-- Node.js 20 LTS (runtime yang sama dengan Dockerfile)
-- npm dengan workspace support
-- Token bot Telegram
-- ID Telegram admin
-- Gambar QRIS merchant JPG/PNG/WebP maksimum 2 MB
+- Node.js 20 LTS, sama dengan runtime pada `Dockerfile`;
+- npm dengan workspace support;
+- token bot Telegram;
+- Telegram user ID admin;
+- gambar QR GoPay merchant JPG/PNG/WebP maksimum 2 MB.
 
 ## Konfigurasi
 
-Salin `.env.example` menjadi `.env`, lalu isi:
+Salin `.env.example` menjadi `.env`, lalu isi nilainya:
 
 ```env
 PORT=3000
@@ -90,22 +114,25 @@ ADMIN_SESSION_SECRET=random-64-char-secret
 ADMIN_ID=123456789
 
 MANUAL_PAYMENT_ENABLED=true
-MANUAL_PAYMENT_METHOD_NAME=QRIS
-MANUAL_PAYMENT_ACCOUNT_NAME=Boslay Store
+MANUAL_PAYMENT_METHOD_NAME=GoPay Merchant QR
+MANUAL_PAYMENT_ACCOUNT_NAME=Ciganstore
 MANUAL_PAYMENT_QRIS_IMAGE=/uploads/payment/qris.png
-MANUAL_PAYMENT_INSTRUCTIONS=Bayar sesuai nominal lalu kirim bukti pembayaran.
+MANUAL_PAYMENT_INSTRUCTIONS=Bayar sesuai nominal top up lalu kirim bukti pembayaran.
 ORDER_EXPIRY_MINUTES=60
 ```
 
-`MANUAL_PAYMENT_QRIS_IMAGE` menunjuk ke file di bawah
-`DATA_DIR/uploads`. Contoh di atas berarti:
+Nama environment `MANUAL_PAYMENT_*` dipertahankan untuk kompatibilitas, tetapi hanya
+mengonfigurasi top up wallet. Tidak ada pembayaran produk langsung melalui QR.
+
+`MANUAL_PAYMENT_QRIS_IMAGE` menunjuk ke file privat di bawah `DATA_DIR/uploads`.
+Contoh di atas berarti:
 
 ```text
 DATA_DIR/uploads/payment/qris.png
 ```
 
-Cara yang direkomendasikan adalah login ke panel admin, buka **Settings → Manual
-QRIS Configuration**, lalu gunakan **Upload / Ganti QRIS**. Upload dari panel:
+Cara yang direkomendasikan adalah login ke panel admin, buka **Settings → GoPay
+Wallet Top Up**, lalu pilih **Unggah / Ganti QR GoPay**. Upload dari panel:
 
 - memvalidasi magic bytes, bukan hanya ekstensi;
 - hanya menerima JPG, PNG, atau WebP;
@@ -115,28 +142,39 @@ QRIS Configuration**, lalu gunakan **Upload / Ganti QRIS**. Upload dari panel:
 - menyimpan file di direktori privat;
 - hanya menyediakan preview melalui endpoint admin terautentikasi.
 
-Nilai yang disimpan dari panel admin mengambil prioritas atas `.env`. Kosongkan
-nilai setting database jika ingin kembali memakai `.env`.
+Nilai yang disimpan melalui panel admin mengambil prioritas atas `.env`. Kosongkan
+setting terkait di database jika ingin kembali menggunakan `.env`.
 
 ## Menjalankan secara lokal
+
+Instal dan validasi proyek:
 
 ```bash
 npm install
 npm run check
 npm test
 npm run build
+```
+
+Mulai server:
+
+```bash
 npm start --workspace @belugaw/server
 ```
 
-Panel admin hasil build dilayani oleh server dari `/admin` ketika direktori
-`apps/server/public/admin` tersedia. Untuk development terpisah:
+Untuk development server dan admin secara terpisah:
 
 ```bash
 npm run dev --workspace @belugaw/server
 npm run dev --workspace @belugaw/admin
 ```
 
-Set `VITE_API_BASE_URL` ke URL server saat panel dijalankan dari origin berbeda.
+Atur `VITE_API_BASE_URL` ke URL server jika panel admin dijalankan dari origin lain.
+Build produksi memakai base path `/admin/`. Server melayani hasil build dari
+`apps/server/public/admin` pada URL `/admin`.
+
+> Jika mesin lokal menggunakan Node selain versi 20 dan native module
+> `better-sqlite3` tidak kompatibel, jalankan instalasi dan test dengan Node.js 20.
 
 ## Docker
 
@@ -146,9 +184,8 @@ docker compose up -d
 docker compose logs -f
 ```
 
-Dockerfile hanya membangun `apps/admin`; proyek ini tidak mempunyai
-`apps/miniapp`. Hasil build disalin ke `/app/apps/server/public/admin`, yaitu
-lokasi yang benar-benar dilayani oleh backend.
+`Dockerfile` membangun panel admin, menyalinnya ke
+`/app/apps/server/public/admin`, lalu menjalankan server dengan Node.js 20.
 
 Volume `./data:/app/data` menyimpan:
 
@@ -159,120 +196,106 @@ data/
 └── uploads/
     ├── downloads/
     └── payment/
-        ├── <qris-uuid>.<ext>
+        ├── <gopay-qr-uuid>.<ext>
         └── proofs/
             └── <proof-uuid>.<ext>
 ```
 
-Jangan expose direktori `data/uploads/payment` sebagai static directory di
-reverse proxy.
+Jangan mengekspos `data/uploads/payment` sebagai static directory di reverse proxy.
 
 ## Telegram webhook
 
-Webhook dapat dipasang dari menu **Settings → Telegram Webhook**, atau manual:
+Webhook dapat dipasang dari **Settings → Telegram Webhook**, atau melalui Telegram
+Bot API dengan URL:
 
-```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://api.domainmu.com/telegram/webhook",
-    "secret_token": "<TELEGRAM_WEBHOOK_SECRET>",
-    "allowed_updates": ["message", "callback_query"]
-  }'
+```text
+https://api.domainmu.com/telegram/webhook
 ```
 
-Tidak ada webhook pembayaran yang perlu didaftarkan.
+Gunakan `TELEGRAM_WEBHOOK_SECRET` sebagai `secret_token` dan aktifkan update
+`message` serta `callback_query`. Tidak ada webhook pembayaran yang perlu
+didaftarkan karena verifikasi GoPay dilakukan manual.
 
-## Panel admin: review pembayaran
+## Panel admin: review top up
 
-Menu **Payments** menampilkan:
+Menu **Top Up Reviews** menampilkan:
 
-- ID order;
-- pembeli dan Telegram user ID;
-- produk dan jumlah;
-- total;
-- waktu order dan waktu bukti dikirim;
+- ID permintaan dan Telegram user ID;
+- nominal saldo yang akan ditambahkan;
+- waktu permintaan dan waktu bukti dikirim;
 - bukti pembayaran;
-- status;
-- admin reviewer;
-- catatan admin;
-- alasan penolakan;
-- error delivery.
+- status, reviewer, catatan, dan alasan penolakan;
+- error pemrosesan saldo jika ada.
 
-Aksi:
+Aksi utama:
 
-- **Setujui Pembayaran** — konfirmasi pembayaran dan mulai delivery;
-- **Tolak Pembayaran** — simpan alasan dan izinkan bukti baru;
-- **Minta Bukti Ulang** — simpan catatan khusus dan minta foto baru;
-- **Coba Kirim Produk Kembali** — hanya muncul setelah delivery gagal.
+- **Setujui & Tambah Saldo** — konfirmasi pembayaran dan kreditkan saldo tepat satu
+  kali;
+- **Tolak Top Up** — simpan alasan dan izinkan pengguna mengirim bukti baru;
+- **Minta Bukti Ulang** — meminta foto baru tanpa membuat top up lain;
+- **Coba Proses Saldo Kembali** — muncul jika proses setelah persetujuan mengalami
+  kendala.
 
-Klik persetujuan dua kali atau dua request bersamaan tidak mengalokasikan stok
-atau mengirim delivery dua kali. Hanya transisi kondisional
-`delivery_pending → delivering` yang memperoleh hak mengirim.
+Riwayat pembayaran produk manual dari versi lama tetap diberi label berbeda agar
+admin dapat mengenalinya.
 
 ## Penyimpanan bukti
 
-Bukti tidak memiliki route publik. Endpoint berikut membutuhkan cookie sesi
-admin yang valid:
+Bukti dan QR merchant tidak mempunyai route publik. Endpoint berikut membutuhkan
+cookie sesi admin yang valid:
 
 ```text
 GET /api/admin/orders/:id/payment-proof
 GET /api/admin/payment/qris-image
 ```
 
-Respons menggunakan `Cache-Control: private, no-store` dan
+Respons memakai `Cache-Control: private, no-store` dan
 `X-Content-Type-Options: nosniff`.
 
 ## Migrasi SQLite
 
 Saat server mulai, `schema.sql` dijalankan dengan `CREATE TABLE/INDEX IF NOT
-EXISTS`, lalu `db.js` menjalankan `ALTER TABLE ... ADD COLUMN` satu per satu.
-Error "column already exists" diabaikan. Tidak ada tabel order lama yang dihapus
-dan foreign key tetap aktif.
+EXISTS`, lalu `db.js` menambah kolom yang belum tersedia. Error kolom yang sudah ada
+diabaikan. Tabel order lama tidak dihapus dan foreign key tetap aktif.
 
-Migrasi juga mengubah setting gateway aktif menjadi `manual` dan mengosongkan
-nilai `sakurupiah_api_id`/`sakurupiah_api_key` lama. Kolom transaksi lama tetap
-ada agar riwayat order tidak rusak, tetapi tidak lagi dipakai runtime.
+Migrasi mengosongkan credential provider lama, menetapkan gateway internal ke
+`wallet`, dan mempertahankan kolom transaksi lama agar riwayat tidak rusak. Produk
+sistem ID `0` dibuat untuk top up tanpa mematikan foreign key secara global.
 
 Kolom tambahan pada `orders` mencakup:
 
-- lokasi dan MIME bukti;
-- waktu bukti dikirim;
-- admin reviewer dan aksi review;
-- alasan penolakan dan catatan admin;
+- lokasi, MIME, dan waktu bukti dikirim;
+- reviewer, aksi review, alasan penolakan, dan catatan admin;
 - waktu pembayaran dikonfirmasi;
-- ID stok yang dialokasikan dan waktunya;
+- ID stok yang dialokasikan dan waktu alokasi;
 - error, waktu, dan jumlah percobaan delivery;
-- penanda top-up wallet sudah dikreditkan.
+- `wallet_credited_at` sebagai penanda kredit top up exact-once.
 
-Tabel `payment_proof_sessions` menghubungkan user Telegram dengan order yang
-sedang menunggu foto, sehingga bukti tidak salah masuk ke order lain.
+Tabel `payment_proof_sessions` menghubungkan pengguna Telegram dengan top up yang
+sedang menunggu foto sehingga bukti tidak salah masuk ke order lain.
 
-Produk sistem ID `0` dibuat untuk top-up wallet. Ini menggantikan pola lama yang
-mematikan foreign key secara global.
-
-Sebelum upgrade production, tetap buat backup:
+Sebelum upgrade production, buat backup:
 
 ```bash
-cp data/belugawbot.db data/belugawbot-before-manual-payment.db
+cp data/belugawbot.db data/belugawbot-before-wallet-upgrade.db
 ```
 
 ## Keamanan dan idempotensi
 
-- User terblokir tetap terblokir ketika mengirim update Telegram.
-- Checkout dan top-up menolak user terblokir.
+- User terblokir tidak dapat checkout atau top up.
+- Nominal top up harus bilangan Rupiah bulat positif.
 - Bukti ditolak untuk order `delivered`, `cancelled`, atau `expired`.
-- Persetujuan memakai update status kondisional.
-- Klaim delivery dan alokasi stok berada dalam transaksi SQLite.
-- Retry memakai `allocated_stock_ids` yang sama.
+- Persetujuan dan klaim delivery memakai transisi status kondisional.
+- Kredit top up dilindungi `wallet_credited_at` dan transaksi SQLite.
+- Checkout wallet, pengurangan stok, dan pengurangan saldo bersifat atomik.
+- Transaction ID unik mencegah pemotongan saldo karena klik ganda.
+- Retry delivery memakai alokasi stok yang sama.
 - Order tidak ditandai `delivered` sebelum pesan produk berhasil dikirim.
-- Secret provider lama tidak ditampilkan atau dapat disimpan dari panel.
-- API publik tidak mengembalikan bukti, credential stok, atau file QRIS.
+- API publik tidak mengembalikan bukti, credential stok, atau file QR GoPay.
 
-Catatan batas eksternal: Telegram Bot API tidak menyediakan idempotency key
-untuk `sendMessage`. Sistem mencegah dua proses delivery bersamaan; pada kegagalan
-jaringan ambigu (Telegram mungkin menerima pesan tetapi respons hilang), admin
-tetap perlu memeriksa chat pembeli sebelum retry.
+Telegram Bot API tidak menyediakan idempotency key untuk `sendMessage`. Sistem
+mencegah dua proses delivery bersamaan, tetapi pada kegagalan jaringan ambigu admin
+sebaiknya memeriksa chat pembeli sebelum melakukan retry.
 
 ## Pengujian
 
@@ -282,16 +305,16 @@ npm test
 npm run build
 ```
 
-Test mencakup:
+Test meliputi:
 
-- pembuatan order;
-- pengiriman dan penggantian bukti;
-- persetujuan/penolakan;
-- persetujuan ganda dan bersamaan;
-- delivery bersamaan;
-- kegagalan Telegram;
-- retry tanpa alokasi stok baru;
-- format/ukuran/path upload tidak valid;
+- pembuatan top up nominal fleksibel;
+- upload, penggantian, persetujuan, dan penolakan bukti;
+- kredit saldo exact-once untuk persetujuan ganda atau bersamaan;
+- checkout wallet atomik dan perlindungan klik ganda;
+- saldo tidak cukup dan stok tidak cukup;
+- delivery bersamaan, kegagalan Telegram, dan retry tanpa potongan baru;
+- migrasi database lama;
+- validasi format, ukuran, dan path upload;
 - blokir user tidak otomatis hilang.
 
 ## Backup
