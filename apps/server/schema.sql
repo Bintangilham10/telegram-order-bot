@@ -211,22 +211,22 @@ CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket ON ticket_messages(ticket_
 
 -- ============ DEFAULT SETTINGS ============
 
-INSERT OR IGNORE INTO settings (key, value) VALUES ('payment_gateway', 'manual');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('payment_gateway', 'wallet');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_enabled', '');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_method_name', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_method_name', 'GoPay Merchant QR');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_account_name', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_qris_image', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('manual_payment_instructions', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('order_expiry_minutes', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('checkout_expiry_minutes', '60');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_name', 'Boslay Store');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_short_name', 'BSLY');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_tagline', 'Belanja produk digital dengan pembayaran otomatis dan pengiriman instan.');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_name', 'Ciganstore');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_short_name', 'CIGAN');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('brand_tagline', 'Belanja produk digital menggunakan saldo wallet dengan pengiriman instan.');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('broadcast_title', 'Pengumuman Resmi');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('support_telegram_url', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('support_whatsapp_url', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('wallet_topup_enabled', '1');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('wallet_min_topup', '10000');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('wallet_min_topup', '1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('review_enabled', '1');
 
 -- Menjaga foreign key tetap aktif untuk order top-up wallet.
@@ -235,3 +235,6 @@ INSERT OR IGNORE INTO products (
 ) VALUES (
   0, 'Wallet Top Up', 'Produk sistem untuk top-up wallet', 0, 'Sistem', 1, 0, datetime('now'), datetime('now')
 );
+
+
+
