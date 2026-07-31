@@ -109,9 +109,13 @@ ADMIN_APP_ORIGIN=https://admin.domainmu.com
 BOT_TOKEN=your-telegram-bot-token
 TELEGRAM_WEBHOOK_SECRET=random-secret-string
 
-ADMIN_PANEL_PASSWORD=strong-password
+ADMIN_PANEL_PASSWORD_HASH=scrypt-hash-dari-perintah-generator
 ADMIN_SESSION_SECRET=random-64-char-secret
+ADMIN_COOKIE_SAME_SITE=Strict
 ADMIN_ID=123456789
+
+TRUST_PROXY=false
+MAX_DIGITAL_FILE_BYTES=52428800
 
 MANUAL_PAYMENT_ENABLED=true
 MANUAL_PAYMENT_METHOD_NAME=GoPay Merchant QR
@@ -120,6 +124,44 @@ MANUAL_PAYMENT_QRIS_IMAGE=/uploads/payment/qris.png
 MANUAL_PAYMENT_INSTRUCTIONS=Bayar sesuai nominal top up lalu kirim bukti pembayaran.
 ORDER_EXPIRY_MINUTES=60
 ```
+
+Buat hash password admin secara interaktif. Password tidak ditampilkan di terminal
+dan tidak disimpan di `.env` sebagai plaintext:
+
+```bash
+npm run security:hash-password --workspace @belugaw/server
+```
+
+Salin seluruh baris `ADMIN_PANEL_PASSWORD_HASH='...'` dari generator ke `.env`.
+Tanda petik tunggal penting agar karakter `$` pada hash tidak diinterpolasi Docker
+Compose. Password minimum 12 karakter. `ADMIN_PANEL_PASSWORD` hanya didukung
+sebagai fallback saat development atau test dan ditolak sebagai konfigurasi
+autentikasi production.
+
+Pada `NODE_ENV=production`, server berhenti saat startup jika:
+
+- `ADMIN_PANEL_PASSWORD_HASH` bukan hash scrypt yang valid;
+- `ADMIN_SESSION_SECRET` atau `TELEGRAM_WEBHOOK_SECRET` kurang dari 32 karakter
+  atau masih berupa placeholder;
+- `API_BASE_URL` atau `ADMIN_APP_ORIGIN` bukan URL HTTPS yang valid.
+
+Gunakan nilai secret acak yang berbeda untuk sesi admin dan webhook Telegram.
+`ADMIN_APP_ORIGIN` harus sama persis dengan origin panel admin yang digunakan
+browser. Request mutasi admin dari origin lain ditolak sebagai perlindungan CSRF.
+
+Cookie sesi memakai `SameSite=Strict` secara default. Biarkan nilai ini untuk
+panel `/admin` yang dilayani server atau subdomain dalam site yang sama. Gunakan
+`ADMIN_COOKIE_SAME_SITE=None` hanya jika panel admin benar-benar berada di site
+(registrable domain) lain; mode tersebut tetap mewajibkan HTTPS, `Secure`, dan
+validasi origin CSRF.
+
+Biarkan `TRUST_PROXY=false` saat server diakses langsung. Aktifkan hanya jika semua
+traffic selalu melewati reverse proxy tepercaya yang menimpa header
+`X-Forwarded-For`, `X-Real-IP`, atau `CF-Connecting-IP`. Jika tidak aktif, rate
+limiter memakai alamat socket dan mengabaikan header tersebut.
+
+`MAX_DIGITAL_FILE_BYTES` membatasi file produk digital sebelum file ditulis ke
+disk. Nilai default adalah 52.428.800 byte (50 MB), dengan rentang 1 KB–250 MB.
 
 Nama environment `MANUAL_PAYMENT_*` dipertahankan untuk kompatibilitas, tetapi hanya
 mengonfigurasi top up wallet. Tidak ada pembayaran produk langsung melalui QR.
@@ -282,6 +324,18 @@ cp data/belugawbot.db data/belugawbot-before-wallet-upgrade.db
 
 ## Keamanan dan idempotensi
 
+- Password admin disimpan sebagai hash scrypt dengan salt acak, bukan plaintext.
+- Signature sesi dan secret webhook dibandingkan secara constant-time.
+- Cookie sesi memakai `HttpOnly`, `Secure` pada HTTPS, dan `SameSite=Strict` secara
+  default. `SameSite=None` harus diaktifkan eksplisit untuk deployment cross-site.
+- Mutasi API admin memvalidasi header `Origin`/`Referer` terhadap allowlist.
+- Respons server memakai CSP, HSTS pada production, anti-framing, `nosniff`, dan
+  kebijakan browser defensif lainnya.
+- Error tak terduga dicatat lengkap di server tetapi disamarkan dari client pada
+  production.
+- Body API, QRIS, dan upload file digital memiliki batas ukuran terpisah.
+- Header proxy hanya dipercaya jika `TRUST_PROXY=true` dan nilainya berupa IP.
+- Penghitungan kuota link download memakai klaim kondisional atomik.
 - User terblokir tidak dapat checkout atau top up.
 - Nominal top up harus bilangan Rupiah bulat positif.
 - Bukti ditolak untuk order `delivered`, `cancelled`, atau `expired`.
@@ -315,6 +369,9 @@ Test meliputi:
 - delivery bersamaan, kegagalan Telegram, dan retry tanpa potongan baru;
 - migrasi database lama;
 - validasi format, ukuran, dan path upload;
+- hash password, signature sesi, CSRF origin, dan security headers;
+- batas ukuran upload produk digital;
+- klaim kuota link download secara atomik;
 - blokir user tidak otomatis hilang.
 
 ## Backup
