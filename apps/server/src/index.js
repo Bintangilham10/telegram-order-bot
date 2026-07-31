@@ -2,16 +2,22 @@
 import "dotenv/config";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { serve } from "@hono/node-server";
+import { getConnInfo } from "@hono/node-server/conninfo";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { isIP } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { initDb, createDb, getRawDb } from "./db.js";
 import {
   createSessionToken,
+  isValidAdminPasswordHash,
   verifySessionToken,
   parseCookie,
+  timingSafeStringEqual,
+  verifyAdminPassword,
 } from "./utils/security.js";
 import {
   answerCallback,
@@ -29,8 +35,17 @@ import {
 } from "./services/payment.js";
 
 const env = process.env;
+const IS_PRODUCTION = env.NODE_ENV === "production";
 const PORT = Number(env.PORT || 3000);
 const DATA_DIR = path.resolve(env.DATA_DIR || "./data");
+const MAX_DIGITAL_FILE_BYTES = parseBoundedInteger(
+  env.MAX_DIGITAL_FILE_BYTES,
+  50 * 1024 * 1024,
+  1024,
+  250 * 1024 * 1024,
+);
+const MAX_QRIS_REQUEST_BYTES = 2 * 1024 * 1024 + 256 * 1024;
+const MAX_API_REQUEST_BYTES = 1024 * 1024;
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 const PAYMENT_UPLOADS_DIR = path.join(UPLOADS_DIR, "payment");
 const PAYMENT_PROOFS_DIR = path.join(PAYMENT_UPLOADS_DIR, "proofs");
@@ -43,16 +58,35 @@ for (const dir of [
 ]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+validateRuntimeSecurityConfig();
 initDb(path.join(DATA_DIR, "belugawbot.db"));
 
 const app = new Hono();
+app.use("*", async (c, next) => {
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "no-referrer");
+  c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  c.header("Cross-Origin-Opener-Policy", "same-origin");
+  c.header("Content-Security-Policy", buildContentSecurityPolicy());
+  if (IS_PRODUCTION) {
+    c.header(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+  }
+  if (c.req.path.startsWith("/api/admin/")) {
+    c.header("Cache-Control", "no-store");
+  }
+  await next();
+});
 app.use(
   "*",
   cors({
     origin: (origin) => {
-      const allowed = [env.ADMIN_APP_ORIGIN, env.API_BASE_URL].filter(Boolean);
-      if (!origin) return env.ADMIN_APP_ORIGIN || "*";
-      return allowed.includes(origin) ? origin : allowed[0] || origin;
+      const allowed = getAllowedAdminOrigins();
+      if (!origin) return null;
+      return allowed.includes(normalizeOrigin(origin)) ? origin : null;
     },
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
@@ -63,6 +97,181 @@ app.use("*", async (c, next) => {
   c.set("db", createDb());
   await next();
 });
+
+const defaultApiBodyLimit = bodyLimit({
+  maxSize: MAX_API_REQUEST_BYTES,
+  onError: (c) => jsonErr(c, "Ukuran request terlalu besar", 413),
+});
+const qrisBodyLimit = bodyLimit({
+  maxSize: MAX_QRIS_REQUEST_BYTES,
+  onError: (c) => jsonErr(c, "Ukuran request terlalu besar", 413),
+});
+const digitalFileBodyLimit = bodyLimit({
+  maxSize: MAX_DIGITAL_FILE_BYTES + 256 * 1024,
+  onError: (c) => jsonErr(c, "Ukuran file digital terlalu besar", 413),
+});
+
+function parseBoundedInteger(value, fallback, minimum, maximum) {
+  if (value === undefined || String(value).trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function normalizeOrigin(value) {
+  try {
+    return new URL(String(value || "").trim()).origin;
+  } catch {
+    return "";
+  }
+}
+
+function getAllowedAdminOrigins() {
+  return [
+    ...new Set(
+      [env.ADMIN_APP_ORIGIN, env.API_BASE_URL]
+        .map(normalizeOrigin)
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function safeErrorMessage(error, fallback = "Operasi gagal diproses") {
+  return IS_PRODUCTION ? fallback : String(error?.message || fallback);
+}
+
+function parseDomainError(error, statusByPrefix, fallback) {
+  const raw = String(error?.message || "");
+  for (const [prefix, status] of Object.entries(statusByPrefix)) {
+    if (raw.startsWith(`${prefix}:`)) {
+      return { message: raw.slice(prefix.length + 1), status };
+    }
+  }
+  return { message: safeErrorMessage(error, fallback), status: 500 };
+}
+
+function isEnabled(value) {
+  return ["1", "true", "yes", "on"].includes(
+    String(value || "")
+      .trim()
+      .toLowerCase(),
+  );
+}
+
+function isPlaceholderSecret(value) {
+  return /^(change|your-|replace|example|random-|strong-password)/i.test(
+    String(value || "").trim(),
+  );
+}
+
+function validateRuntimeSecurityConfig() {
+  if (!IS_PRODUCTION) return;
+  const failures = [];
+  if (!isValidAdminPasswordHash(env.ADMIN_PANEL_PASSWORD_HASH)) {
+    failures.push(
+      "ADMIN_PANEL_PASSWORD_HASH harus berupa hash scrypt yang valid",
+    );
+  }
+  if (
+    String(env.ADMIN_SESSION_SECRET || "").length < 32 ||
+    isPlaceholderSecret(env.ADMIN_SESSION_SECRET)
+  ) {
+    failures.push("ADMIN_SESSION_SECRET harus acak dan minimal 32 karakter");
+  }
+  if (
+    String(env.TELEGRAM_WEBHOOK_SECRET || "").length < 32 ||
+    isPlaceholderSecret(env.TELEGRAM_WEBHOOK_SECRET)
+  ) {
+    failures.push("TELEGRAM_WEBHOOK_SECRET harus acak dan minimal 32 karakter");
+  }
+  for (const [name, value] of [
+    ["API_BASE_URL", env.API_BASE_URL],
+    ["ADMIN_APP_ORIGIN", env.ADMIN_APP_ORIGIN],
+  ]) {
+    const origin = normalizeOrigin(value);
+    if (!origin?.startsWith("https://")) {
+      failures.push(`${name} harus berupa URL HTTPS yang valid`);
+    }
+  }
+  const sameSite = String(env.ADMIN_COOKIE_SAME_SITE || "Strict").toLowerCase();
+  if (!["strict", "lax", "none"].includes(sameSite)) {
+    failures.push("ADMIN_COOKIE_SAME_SITE hanya boleh Strict, Lax, atau None");
+  }
+  if (failures.length) {
+    throw new Error(
+      `Konfigurasi keamanan production tidak valid:\n- ${failures.join("\n- ")}`,
+    );
+  }
+}
+
+function buildContentSecurityPolicy() {
+  const apiOrigin = normalizeOrigin(env.API_BASE_URL);
+  const connectDirective = ["connect-src 'self'", apiOrigin]
+    .filter(Boolean)
+    .join(" ");
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
+    "img-src 'self' data: blob: https:",
+    connectDirective,
+  ].join("; ");
+}
+
+function getClientIp(c) {
+  let directIp = "unknown";
+  try {
+    directIp = String(getConnInfo(c)?.remote?.address || "unknown");
+  } catch {}
+  if (!isEnabled(env.TRUST_PROXY)) return directIp.slice(0, 128);
+  const forwarded =
+    c.req.header("cf-connecting-ip") ||
+    c.req.header("x-real-ip") ||
+    c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
+  const forwardedIp = String(forwarded || "").trim();
+  return (isIP(forwardedIp) ? forwardedIp : directIp).slice(0, 128);
+}
+
+function isAdminMutationRequest(c) {
+  return (
+    c.req.path.startsWith("/api/admin/") &&
+    !["GET", "HEAD", "OPTIONS"].includes(c.req.method.toUpperCase())
+  );
+}
+
+function isTrustedAdminOrigin(c) {
+  const origin =
+    normalizeOrigin(c.req.header("origin")) ||
+    normalizeOrigin(c.req.header("referer"));
+  if (!origin) return !IS_PRODUCTION;
+  return getAllowedAdminOrigins().includes(origin);
+}
+
+function getSessionCookieAttributes(maxAge) {
+  const apiOrigin = normalizeOrigin(env.API_BASE_URL);
+  const secure = IS_PRODUCTION || apiOrigin.startsWith("https://");
+  const normalizedSameSite = String(
+    env.ADMIN_COOKIE_SAME_SITE || "Strict",
+  ).toLowerCase();
+  const sameSiteOptions = { strict: "Strict", lax: "Lax", none: "None" };
+  const requestedSameSite = sameSiteOptions[normalizedSameSite] || "Strict";
+  const sameSite =
+    requestedSameSite === "None" && !secure ? "Strict" : requestedSameSite;
+  return [
+    "HttpOnly",
+    secure ? "Secure" : "",
+    `SameSite=${sameSite}`,
+    "Path=/",
+    `Max-Age=${maxAge}`,
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
 
 // ============ RATE LIMITING ============
 const rateLimitStore = new Map();
@@ -610,7 +819,7 @@ async function requireAdmin(c, next) {
   const secret = env.ADMIN_SESSION_SECRET;
   if (!token || !secret) return jsonErr(c, "Unauthorized", 401);
   const payload = verifySessionToken(token, secret);
-  if (!payload || payload.role !== "admin")
+  if (payload?.role !== "admin" || !payload.sub)
     return jsonErr(c, "Unauthorized", 401);
   c.set("admin", payload);
   await next();
@@ -1137,19 +1346,25 @@ async function sendStartMenu(chatId, firstName = "Kak", options = {}) {
 
 // ============ RATE LIMIT MIDDLEWARE ============
 app.use("/api/*", async (c, next) => {
-  const ip =
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    c.req.header("x-real-ip") ||
-    c.req.header("cf-connecting-ip") ||
-    "unknown";
+  const ip = getClientIp(c);
   const key = `api:${ip}`;
   if (!rateLimit(key, 200, 60000))
     return c.json(
       { ok: false, error: "Too many requests. Coba lagi nanti." },
       429,
     );
-  await next();
+  if (isAdminMutationRequest(c) && !isTrustedAdminOrigin(c)) {
+    return jsonErr(c, "Origin request tidak diizinkan", 403);
+  }
+  if (c.req.path === "/api/admin/uploads/digital-file") {
+    return digitalFileBodyLimit(c, next);
+  }
+  if (c.req.path === "/api/admin/payment/qris-image") {
+    return qrisBodyLimit(c, next);
+  }
+  return defaultApiBodyLimit(c, next);
 });
+app.use("/telegram/webhook", defaultApiBodyLimit);
 
 // ============ ROUTES: HEALTH ============
 app.get("/health", (c) =>
@@ -1166,7 +1381,10 @@ app.get("/", (c) => {
 // ============ ROUTES: TELEGRAM WEBHOOK ============
 app.post("/telegram/webhook", async (c) => {
   const secret = c.req.header("x-telegram-bot-api-secret-token");
-  if (env.TELEGRAM_WEBHOOK_SECRET && secret !== env.TELEGRAM_WEBHOOK_SECRET)
+  if (
+    env.TELEGRAM_WEBHOOK_SECRET &&
+    !timingSafeStringEqual(secret || "", env.TELEGRAM_WEBHOOK_SECRET)
+  )
     return jsonErr(c, "Forbidden", 403);
   const db = c.get("db");
   const update = await c.req.json();
@@ -1406,10 +1624,7 @@ app.post("/telegram/webhook", async (c) => {
 
 // ============ ROUTES: ADMIN ============
 app.post("/api/admin/login", async (c) => {
-  const ip =
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    c.req.header("x-real-ip") ||
-    "unknown";
+  const ip = getClientIp(c);
   const loginKey = `admin_login:${ip}`;
   if (!rateLimit(loginKey, 5, 300000))
     return jsonErr(
@@ -1417,24 +1632,32 @@ app.post("/api/admin/login", async (c) => {
       "Terlalu banyak percobaan login. Coba lagi dalam 5 menit.",
       429,
     );
-  const body = await c.req.json();
-  if (!body.password || body.password !== env.ADMIN_PANEL_PASSWORD)
-    return jsonErr(c, "Password salah", 401);
+  const body = await c.req.json().catch(() => ({}));
+  const password = typeof body.password === "string" ? body.password : "";
+  const passwordHash = env.ADMIN_PANEL_PASSWORD_HASH;
+  const validPassword = isValidAdminPasswordHash(passwordHash)
+    ? await verifyAdminPassword(password, passwordHash)
+    : !IS_PRODUCTION &&
+      Boolean(env.ADMIN_PANEL_PASSWORD) &&
+      timingSafeStringEqual(password, env.ADMIN_PANEL_PASSWORD);
+  if (!validPassword) return jsonErr(c, "Password salah", 401);
   const token = createSessionToken(
-    { role: "admin", iat: Date.now(), exp: Date.now() + 86400000 },
+    {
+      role: "admin",
+      sub: String(env.ADMIN_ID || "admin"),
+      iat: Date.now(),
+      exp: Date.now() + 86400000,
+    },
     env.ADMIN_SESSION_SECRET,
   );
   c.header(
     "Set-Cookie",
-    `tb_session=${token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=86400`,
+    `tb_session=${token}; ${getSessionCookieAttributes(86400)}`,
   );
   return jsonOk(c, { message: "Login sukses" });
 });
 app.post("/api/admin/logout", requireAdmin, async (c) => {
-  c.header(
-    "Set-Cookie",
-    "tb_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0",
-  );
+  c.header("Set-Cookie", `tb_session=; ${getSessionCookieAttributes(0)}`);
   return jsonOk(c, { message: "Logout sukses" });
 });
 app.get("/api/admin/bootstrap", requireAdmin, async (c) => {
@@ -1471,7 +1694,9 @@ app.get("/api/admin/bootstrap", requireAdmin, async (c) => {
     systemStatus: {
       secrets: {
         BOT_TOKEN: Boolean(env.BOT_TOKEN),
-        ADMIN_PANEL_PASSWORD: Boolean(env.ADMIN_PANEL_PASSWORD),
+        ADMIN_PANEL_PASSWORD_HASH: isValidAdminPasswordHash(
+          env.ADMIN_PANEL_PASSWORD_HASH,
+        ),
         ADMIN_SESSION_SECRET: Boolean(env.ADMIN_SESSION_SECRET),
         TELEGRAM_WEBHOOK_SECRET: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
       },
@@ -1570,13 +1795,13 @@ app.post("/api/admin/payment/qris-image", requireAdmin, async (c) => {
   if (!file || typeof file === "string")
     return jsonErr(c, "Gambar QRIS wajib diisi");
   if (Number(file.size || 0) > 2 * 1024 * 1024)
-    return jsonErr(c, "Ukuran gambar maksimum 2 MB");
+    return jsonErr(c, "Ukuran gambar maksimum 2 MB", 413);
   const buffer = Buffer.from(await file.arrayBuffer());
   let type;
   try {
     type = validatePaymentImage(buffer);
   } catch (err) {
-    return jsonErr(c, err.message);
+    return jsonErr(c, safeErrorMessage(err, "Gambar QRIS tidak valid"));
   }
   const key = `payment/${createRandomImageName(type.extension)}`;
   const resolved = resolvePrivateUploadPath(UPLOADS_DIR, key, ["payment"]);
@@ -1610,7 +1835,7 @@ app.get("/api/admin/payment/qris-image", requireAdmin, async (c) => {
       },
     });
   } catch (err) {
-    return jsonErr(c, err.message, 404);
+    return jsonErr(c, safeErrorMessage(err, "Gambar QRIS tidak tersedia"), 404);
   }
 });
 app.get("/api/admin/telegram/webhook/status", requireAdmin, async (c) => {
@@ -1625,7 +1850,11 @@ app.get("/api/admin/telegram/webhook/status", requireAdmin, async (c) => {
       info,
     });
   } catch (err) {
-    return jsonErr(c, err.message, 500);
+    return jsonErr(
+      c,
+      safeErrorMessage(err, "Status webhook tidak dapat diperiksa"),
+      502,
+    );
   }
 });
 app.post("/api/admin/telegram/webhook/setup", requireAdmin, async (c) => {
@@ -1863,6 +2092,15 @@ app.post("/api/admin/uploads/digital-file", requireAdmin, async (c) => {
   const file = form.get("file");
   if (!file || typeof file === "string")
     return jsonErr(c, "File digital wajib diisi");
+  const fileSize = Number(file.size || 0);
+  if (!Number.isSafeInteger(fileSize) || fileSize < 1)
+    return jsonErr(c, "File digital kosong atau tidak valid");
+  if (fileSize > MAX_DIGITAL_FILE_BYTES)
+    return jsonErr(
+      c,
+      `Ukuran file digital maksimum ${Math.floor(MAX_DIGITAL_FILE_BYTES / 1024 / 1024)} MB`,
+      413,
+    );
   const safeName = String(file.name || "download.bin").replace(
     /[^a-zA-Z0-9._-]+/g,
     "_",
@@ -1908,7 +2146,11 @@ app.get("/api/admin/orders/:id/payment-proof", requireAdmin, async (c) => {
       },
     });
   } catch (err) {
-    return jsonErr(c, err.message, 404);
+    return jsonErr(
+      c,
+      safeErrorMessage(err, "Bukti pembayaran tidak tersedia"),
+      404,
+    );
   }
 });
 app.post("/api/admin/orders/:id/approve-payment", requireAdmin, async (c) => {
@@ -1924,11 +2166,12 @@ app.post("/api/admin/orders/:id/approve-payment", requireAdmin, async (c) => {
       String(body?.note || "").trim(),
     );
   } catch (err) {
-    return jsonErr(
-      c,
-      String(err.message).replace(/^[A-Z_]+:/, ""),
-      err.message.startsWith("ORDER_NOT_FOUND:") ? 404 : 409,
+    const failure = parseDomainError(
+      err,
+      { ORDER_NOT_FOUND: 404, INVALID_STATUS: 409 },
+      "Pembayaran tidak dapat disetujui",
     );
+    return jsonErr(c, failure.message, failure.status);
   }
   if (
     !approved.changed &&
@@ -1951,7 +2194,10 @@ app.post("/api/admin/orders/:id/approve-payment", requireAdmin, async (c) => {
     });
     return jsonErr(
       c,
-      `Pembayaran disetujui, tetapi pengiriman gagal: ${err.message}`,
+      safeErrorMessage(
+        err,
+        "Pembayaran disetujui, tetapi pengiriman gagal. Periksa log server.",
+      ),
       502,
     );
   }
@@ -1974,11 +2220,12 @@ app.post("/api/admin/orders/:id/reject-payment", requireAdmin, async (c) => {
       String(body?.note || "").trim(),
     );
   } catch (err) {
-    return jsonErr(
-      c,
-      String(err.message).replace(/^[A-Z_]+:/, ""),
-      err.message.startsWith("ORDER_NOT_FOUND:") ? 404 : 409,
+    const failure = parseDomainError(
+      err,
+      { ORDER_NOT_FOUND: 404, INVALID_STATUS: 409 },
+      "Pembayaran tidak dapat ditolak",
     );
+    return jsonErr(c, failure.message, failure.status);
   }
   const brand = getBrandSettings(db);
   try {
@@ -2030,11 +2277,12 @@ app.post("/api/admin/orders/:id/request-new-proof", requireAdmin, async (c) => {
       expiresAt,
     );
   } catch (err) {
-    return jsonErr(
-      c,
-      String(err.message).replace(/^[A-Z_]+:/, ""),
-      err.message.startsWith("ORDER_NOT_FOUND:") ? 404 : 409,
+    const failure = parseDomainError(
+      err,
+      { ORDER_NOT_FOUND: 404, INVALID_STATUS: 409 },
+      "Permintaan bukti baru gagal diproses",
     );
+    return jsonErr(c, failure.message, failure.status);
   }
   const brand = getBrandSettings(db);
   try {
@@ -2086,7 +2334,14 @@ app.post("/api/admin/orders/:id/retry-delivery", requireAdmin, async (c) => {
     db.insertAudit("order.retry_delivery", "admin", { orderId: id, delivery });
     return jsonOk(c, { id, status: db.getOrderById(id).status, delivery });
   } catch (err) {
-    return jsonErr(c, `Pengiriman masih gagal: ${err.message}`, 502);
+    return jsonErr(
+      c,
+      safeErrorMessage(
+        err,
+        "Pengiriman masih gagal. Periksa log server sebelum mencoba lagi.",
+      ),
+      502,
+    );
   }
 });
 app.get("/api/admin/reviews", requireAdmin, async (c) =>
@@ -2176,7 +2431,7 @@ app.post("/api/admin/wallets/:userId/adjust", requireAdmin, async (c) => {
     });
     return jsonOk(c, { userId, newBalance, amount, description });
   } catch (err) {
-    return jsonErr(c, err.message);
+    return jsonErr(c, safeErrorMessage(err, "Penyesuaian saldo gagal"));
   }
 });
 app.post("/api/admin/users/:userId/block", requireAdmin, async (c) => {
@@ -2207,7 +2462,7 @@ app.post("/api/admin/backup", requireAdmin, async (c) => {
     c.get("db").insertAudit("backup.manual", "admin");
     return jsonOk(c, { message: "Backup started" });
   } catch (err) {
-    return jsonErr(c, err.message);
+    return jsonErr(c, safeErrorMessage(err, "Backup gagal dibuat"));
   }
 });
 app.get("/api/admin/backups", requireAdmin, async (c) => {
@@ -2272,15 +2527,15 @@ app.get("/api/shop/download/:token", async (c) => {
   const db = c.get("db");
   const token = String(c.req.param("token") || "").trim();
   if (!token) return jsonErr(c, "Token tidak valid", 400);
-  const grant = db.getDownloadToken(token);
-  if (!grant) return jsonErr(c, "Link tidak valid", 404);
-  if (Date.now() > new Date(grant.expires_at).getTime())
+  const candidate = db.getDownloadToken(token);
+  if (!candidate) return jsonErr(c, "Link tidak valid", 404);
+  if (Date.now() > new Date(candidate.expires_at).getTime())
     return jsonErr(c, "Link expired", 410);
-  if (Number(grant.download_count) >= Number(grant.max_downloads))
+  if (Number(candidate.download_count) >= Number(candidate.max_downloads))
     return jsonErr(c, "Batas download habis", 410);
   let resolved;
   try {
-    resolved = resolvePrivateUploadPath(UPLOADS_DIR, grant.object_key, [
+    resolved = resolvePrivateUploadPath(UPLOADS_DIR, candidate.object_key, [
       "downloads",
     ]);
   } catch {
@@ -2288,9 +2543,10 @@ app.get("/api/shop/download/:token", async (c) => {
   }
   if (!fs.existsSync(resolved.path))
     return jsonErr(c, "File tidak ditemukan", 404);
-  db.incrementDownloadCount(token);
-  const fileName = basenameFromKey(resolved.key);
   const fileBuffer = fs.readFileSync(resolved.path);
+  const grant = db.claimDownloadToken(token);
+  if (!grant) return jsonErr(c, "Link expired atau batas download habis", 410);
+  const fileName = basenameFromKey(resolved.key);
   return new Response(fileBuffer, {
     status: 200,
     headers: {
@@ -2349,7 +2605,8 @@ if (fs.existsSync(adminDir)) {
 // ============ ERROR HANDLER ============
 app.onError((err, c) => {
   console.error("[API ERROR]", err);
-  return jsonErr(c, err.message || "Internal server error", 500);
+  const fallback = "Internal server error";
+  return jsonErr(c, IS_PRODUCTION ? fallback : err.message || fallback, 500);
 });
 
 // ============ EXPIRY JOB ============
