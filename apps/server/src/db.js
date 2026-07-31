@@ -1002,10 +1002,19 @@ export function createDb() {
       );
     },
 
-    incrementDownloadCount(token) {
-      db.prepare(
-        "UPDATE download_tokens SET download_count = download_count + 1 WHERE token = ?",
-      ).run(token);
+    claimDownloadToken(token) {
+      return (
+        db
+          .prepare(
+            `UPDATE download_tokens
+             SET download_count = download_count + 1
+             WHERE token = ?
+               AND expires_at > ?
+               AND download_count < max_downloads
+             RETURNING *`,
+          )
+          .get(token, nowIso()) || null
+      );
     },
 
     // ============ SETTINGS ============
