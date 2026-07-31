@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "check": "node --check src/index.js && node --check src/db.js && node --check src/services/payment.js && node --check src/services/telegram.js",
+    "check": "node --check src/index.js && node --check src/db.js && node --check src/services/payment.js && node --check src/services/telegram.js && node --check src/scripts/hash-admin-password.js",
+    "security:hash-password": "node src/scripts/hash-admin-password.js",
     "test": "node --test"
   },
   "dependencies": {
